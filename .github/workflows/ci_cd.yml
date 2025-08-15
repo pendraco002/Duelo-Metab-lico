@@ -1,0 +1,316 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  release:
+    types: [published]
+
+env:
+  FLUTTER_VERSION: '3.16.5'
+  JAVA_VERSION: '17'
+  NODE_VERSION: '18'
+
+jobs:
+  # Code Quality and Testing
+  quality_check:
+    name: Code Quality & Testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        flutter-version: ${{ env.FLUTTER_VERSION }}
+        channel: 'stable'
+        cache: true
+
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: ${{ env.JAVA_VERSION }}
+
+    - name: Get dependencies
+      run: flutter pub get
+
+    - name: Verify formatting
+      run: dart format --output=none --set-exit-if-changed .
+
+    - name: Analyze project source
+      run: flutter analyze
+
+    - name: Run code generation
+      run: |
+        flutter packages pub run build_runner build --delete-conflicting-outputs
+        git diff --exit-code
+
+    - name: Run unit tests
+      run: flutter test --coverage --test-randomize-ordering-seed random
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: coverage/lcov.info
+        flags: unittests
+        name: codecov-umbrella
+
+    - name: Run integration tests
+      uses: reactivecircus/android-emulator-runner@v2
+      with:
+        api-level: 29
+        script: flutter test integration_test/
+
+  # Security Scanning
+  security_scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run dependency security scan
+      run: |
+        curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+        grype .
+
+    - name: Run code security scan
+      uses: github/super-linter/slim@v4
+      env:
+        DEFAULT_BRANCH: main
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        VALIDATE_DART: true
+        VALIDATE_YAML: true
+        VALIDATE_JSON: true
+
+  # Build Android
+  build_android:
+    name: Build Android
+    runs-on: ubuntu-latest
+    needs: [quality_check, security_scan]
+    timeout-minutes: 45
+    
+    strategy:
+      matrix:
+        build_type: [debug, release]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        flutter-version: ${{ env.FLUTTER_VERSION }}
+        channel: 'stable'
+        cache: true
+
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: ${{ env.JAVA_VERSION }}
+
+    - name: Get dependencies
+      run: flutter pub get
+
+    - name: Run code generation
+      run: flutter packages pub run build_runner build --delete-conflicting-outputs
+
+    - name: Setup Android keystore
+      if: matrix.build_type == 'release'
+      run: |
+        echo "${{ secrets.ANDROID_KEYSTORE }}" | base64 --decode > android/app/keystore.jks
+        echo "storeFile=keystore.jks" >> android/key.properties
+        echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" >> android/key.properties
+        echo "storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}" >> android/key.properties
+        echo "keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}" >> android/key.properties
+
+    - name: Build Android APK
+      if: matrix.build_type == 'debug'
+      run: flutter build apk --debug
+
+    - name: Build Android App Bundle
+      if: matrix.build_type == 'release'
+      run: flutter build appbundle --release
+
+    - name: Upload Android artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: android-${{ matrix.build_type }}
+        path: |
+          build/app/outputs/flutter-apk/*.apk
+          build/app/outputs/bundle/release/*.aab
+
+  # Build iOS
+  build_ios:
+    name: Build iOS
+    runs-on: macos-latest
+    needs: [quality_check, security_scan]
+    timeout-minutes: 60
+    
+    strategy:
+      matrix:
+        build_type: [debug, release]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        flutter-version: ${{ env.FLUTTER_VERSION }}
+        channel: 'stable'
+        cache: true
+
+    - name: Get dependencies
+      run: flutter pub get
+
+    - name: Run code generation
+      run: flutter packages pub run build_runner build --delete-conflicting-outputs
+
+    - name: Setup iOS certificates
+      if: matrix.build_type == 'release'
+      env:
+        IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+        IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+        IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+      run: |
+        echo "$IOS_CERTIFICATE" | base64 --decode > ios_certificate.p12
+        echo "$IOS_PROVISIONING_PROFILE" | base64 --decode > ios_profile.mobileprovision
+        
+        security create-keychain -p "" build.keychain
+        security import ios_certificate.p12 -t agg -k build.keychain -P "$IOS_CERTIFICATE_PASSWORD" -A
+        security list-keychains -s build.keychain
+        security default-keychain -s build.keychain
+        security unlock-keychain -p "" build.keychain
+        security set-keychain-settings -t 3600 -u build.keychain
+        
+        mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+        cp ios_profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+
+    - name: Build iOS app
+      run: |
+        if [ "${{ matrix.build_type }}" == "debug" ]; then
+          flutter build ios --debug --no-codesign
+        else
+          flutter build ios --release
+        fi
+
+    - name: Upload iOS artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ios-${{ matrix.build_type }}
+        path: build/ios/iphoneos/*.app
+
+  # Performance Testing
+  performance_test:
+    name: Performance Testing
+    runs-on: ubuntu-latest
+    needs: build_android
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download Android APK
+      uses: actions/download-artifact@v4
+      with:
+        name: android-debug
+
+    - name: Run performance tests
+      uses: reactivecircus/android-emulator-runner@v2
+      with:
+        api-level: 29
+        script: |
+          flutter drive --driver=test_driver/perf_test.dart --target=integration_test/performance_test.dart
+
+  # Deployment
+  deploy_internal:
+    name: Deploy to Internal Testing
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    needs: [build_android, build_ios]
+    timeout-minutes: 20
+    
+    steps:
+    - name: Download Android AAB
+      uses: actions/download-artifact@v4
+      with:
+        name: android-release
+
+    - name: Deploy to Google Play Internal Testing
+      uses: r0adkll/upload-google-play@v1
+      with:
+        serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
+        packageName: com.duelometabolico.app
+        releaseFiles: build/app/outputs/bundle/release/*.aab
+        track: internal
+        status: completed
+
+    - name: Deploy to TestFlight
+      uses: apple-actions/upload-testflight-build@v1
+      with:
+        app-path: build/ios/iphoneos/Runner.app
+        issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
+        api-key-id: ${{ secrets.APPSTORE_API_KEY_ID }}
+        api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+
+  # Production Deployment
+  deploy_production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    needs: [build_android, build_ios, performance_test]
+    timeout-minutes: 30
+    environment: production
+    
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+
+    - name: Deploy to Google Play Store
+      uses: r0adkll/upload-google-play@v1
+      with:
+        serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
+        packageName: com.duelometabolico.app
+        releaseFiles: android-release/*.aab
+        track: production
+        status: completed
+        whatsNewDirectory: metadata/android/pt-BR/changelogs
+
+    - name: Deploy to App Store
+      uses: apple-actions/upload-testflight-build@v1
+      with:
+        app-path: ios-release/Runner.app
+        issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
+        api-key-id: ${{ secrets.APPSTORE_API_KEY_ID }}
+        api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+
+  # Notification
+  notify:
+    name: Notify Team
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [quality_check, security_scan, build_android, build_ios]
+    
+    steps:
+    - name: Notify Slack
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#duelo-metabolico-dev'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow
